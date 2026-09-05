@@ -4,27 +4,30 @@
 #include "SnowDeformationSubsystem.h"
 #include "Engine/World.h"
 #include "UObject/ConstructorHelpers.h"
+#include "CanvasItem.h"
+#include "CanvasTypes.h"
+#include "Engine/Canvas.h"
+#include "RenderingThread.h"
+#include "RHICommandList.h"
+#include "Kismet/KismetRenderingLibrary.h"
 
 ASnowDeformationVolume::ASnowDeformationVolume()
 {
 	PrimaryActorTick.bCanEverTick = false;
 
-	// 1. 루트 박스 컴포넌트 생성 (기본 크기: 50m x 50m x 2m)
 	BoundsBox = CreateDefaultSubobject<UBoxComponent>(TEXT("BoundsBox"));
 	RootComponent = BoundsBox;
 	BoundsBox->SetBoxExtent(FVector(2500.0f, 2500.0f, 100.0f));
 	BoundsBox->SetCollisionProfileName(TEXT("NoCollision"));
 	BoundsBox->SetLineThickness(2.0f);
-	BoundsBox->ShapeColor = FColor(135, 206, 250); // 하늘색 와이어프레임
+	BoundsBox->ShapeColor = FColor(135, 206, 250);
 
-	// 2. 자식 눈 장판(Plane) 메쉬 컴포넌트 생성 (나나이트 WPO 실시간 활성화)
 	SnowPlaneMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("SnowPlaneMesh"));
 	SnowPlaneMesh->SetupAttachment(BoundsBox);
 	SnowPlaneMesh->SetCollisionProfileName(TEXT("NoCollision"));
 	SnowPlaneMesh->SetCastShadow(true);
 	SnowPlaneMesh->bEvaluateWorldPositionOffset = true;
 
-	// 프로젝트 전용 SM_Snow 우선 로드, 없으면 SM_SnowPlane 및 기본 Plane 순으로 폴백
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> CustomSnowMeshFinder(TEXT("/Game/snow_deformation/SM_Snow.SM_Snow"));
 	if (CustomSnowMeshFinder.Succeeded())
 	{
@@ -47,7 +50,6 @@ ASnowDeformationVolume::ASnowDeformationVolume()
 		}
 	}
 
-	// 기본 머티리얼 템플릿 자동 바인딩
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> GroundMatFinder(TEXT("/Game/snow_deformation/M_SnowGround.M_SnowGround"));
 	if (GroundMatFinder.Succeeded())
 	{
@@ -80,7 +82,6 @@ void ASnowDeformationVolume::OnConstruction(const FTransform& Transform)
 	{
 		SnowPlaneMesh->SetVisibility(true);
 
-		// 1. 박스 Extent 크기에 맞춰 Plane 메쉬 Scale 1:1 자동 매핑 (스태틱 메시의 실제 크기 기반 정밀 매핑)
 		const FVector BoxExtent = BoundsBox->GetScaledBoxExtent();
 		float MeshWidth = 100.0f;
 		float MeshDepth = 100.0f;
@@ -98,115 +99,93 @@ void ASnowDeformationVolume::OnConstruction(const FTransform& Transform)
 		SnowPlaneMesh->SetRelativeLocation(FVector(0.0f, 0.0f, -BoundsBox->GetUnscaledBoxExtent().Z + 0.1f));
 		SnowPlaneMesh->SetRelativeScale3D(FVector(ScaleX, ScaleY, 1.0f));
 
-		// 2. 동적 머티리얼 인스턴스(MID) 파라미터 실시간 전달
 		UpdateMaterialParameters();
 	}
 	else
 	{
 		SnowPlaneMesh->SetVisibility(false);
 	}
-
-	SyncBoundsToSubsystem();
 }
 
 void ASnowDeformationVolume::BeginPlay()
 {
 	Super::BeginPlay();
 
+	CreatePingPongResources();
 	UpdateMaterialParameters();
-	SyncBoundsToSubsystem();
 
-	UE_LOG(LogTemp, Warning, TEXT("[SnowVolume::BeginPlay] Volume: %s | MeshComp: %s | StaticMesh: %s | SnowTemplate: %s | BrushTemplate: %s | SnowMID: %s"),
-		*GetNameSafe(this),
-		*GetNameSafe(SnowPlaneMesh),
-		SnowPlaneMesh ? *GetNameSafe(SnowPlaneMesh->GetStaticMesh()) : TEXT("None"),
-		*GetNameSafe(SnowMaterialTemplate),
-		*GetNameSafe(BrushMaterialTemplate),
-		*GetNameSafe(SnowMID));
-
-	if (!SnowMaterialTemplate && GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(54322, 5.0f, FColor::Red, TEXT("[Snow Volume ERROR] SnowMaterialTemplate is NULL! Please assign M_SnowGround in SnowDeformationVolume Details!"));
-	}
-
-	if (!BrushMaterialTemplate && GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(54323, 5.0f, FColor::Red, TEXT("[Snow Volume ERROR] BrushMaterialTemplate is NULL! Please assign M_SnowBrush in SnowDeformationVolume Details!"));
-	}
-
-	// 게임 시작 시 서브시스템에 브러시/풍화 머티리얼 전달 및 렌더 타깃 갱신 델리게이트 바인딩
 	if (UWorld* World = GetWorld())
 	{
 		if (USnowDeformationSubsystem* Subsystem = World->GetSubsystem<USnowDeformationSubsystem>())
 		{
-			if (BrushMaterialTemplate)
-			{
-				Subsystem->SetBrushMaterialTemplate(BrushMaterialTemplate);
-			}
-
-			if (ErosionMaterialTemplate)
-			{
-				Subsystem->SetErosionMaterialTemplate(ErosionMaterialTemplate);
-			}
-
-			Subsystem->OnRenderTargetUpdated.AddDynamic(this, &ASnowDeformationVolume::OnRenderTargetChanged);
-
-			if (SnowMID && Subsystem->GetCurrentReadRenderTarget())
-			{
-				UTextureRenderTarget2D* ActiveRT = Subsystem->GetCurrentReadRenderTarget();
-				SnowMID->SetTextureParameterValue(TEXT("RT_SnowHeight"), ActiveRT);
-				SnowMID->SetTextureParameterValue(TEXT("snowHeight"), ActiveRT);
-				SnowMID->SetTextureParameterValue(TEXT("SnowHeight"), ActiveRT);
-				SnowMID->SetTextureParameterValue(TEXT("RT_Height"), ActiveRT);
-				SnowMID->SetTextureParameterValue(TEXT("RT_Snow"), ActiveRT);
-				SnowMID->SetTextureParameterValue(TEXT("DeformationRT"), ActiveRT);
-				SnowMID->SetTextureParameterValue(TEXT("Texture"), ActiveRT);
-
-				UE_LOG(LogTemp, Warning, TEXT("[SnowVolume::BeginPlay] Initial RT bound to SnowMID: %s"), *GetNameSafe(ActiveRT));
-			}
+			Subsystem->RegisterVolume(this);
 		}
 	}
 }
 
-void ASnowDeformationVolume::OnRenderTargetChanged(UTextureRenderTarget2D* NewRT)
+void ASnowDeformationVolume::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	if (SnowMID && NewRT)
+	if (UWorld* World = GetWorld())
 	{
-		SnowMID->SetTextureParameterValue(TEXT("RT_SnowHeight"), NewRT);
-		SnowMID->SetTextureParameterValue(TEXT("snowHeight"), NewRT);
-		SnowMID->SetTextureParameterValue(TEXT("SnowHeight"), NewRT);
-		SnowMID->SetTextureParameterValue(TEXT("RT_Height"), NewRT);
-		SnowMID->SetTextureParameterValue(TEXT("RT_Snow"), NewRT);
-		SnowMID->SetTextureParameterValue(TEXT("DeformationRT"), NewRT);
-		SnowMID->SetTextureParameterValue(TEXT("Texture"), NewRT);
-
-		if (BoundsBox)
+		if (USnowDeformationSubsystem* Subsystem = World->GetSubsystem<USnowDeformationSubsystem>())
 		{
-			const FVector BoxExtent = BoundsBox->GetScaledBoxExtent();
-			SnowMID->SetVectorParameterValue(TEXT("SnowAreaCenter"), GetActorLocation());
-			SnowMID->SetScalarParameterValue(TEXT("SnowAreaSize"), BoxExtent.X * 2.0f);
-			SnowMID->SetScalarParameterValue(TEXT("SnowDepth"), SnowDepth);
-			SnowMID->SetScalarParameterValue(TEXT("EdgeSoftness"), EdgeSoftness);
+			Subsystem->UnregisterVolume(this);
 		}
+	}
+	Super::EndPlay(EndPlayReason);
+}
 
-		UE_LOG(LogTemp, Display, TEXT("[SnowVolume::OnRenderTargetChanged] Updated SnowMID (%s) with RT: %s"),
-			*GetNameSafe(SnowMID), *GetNameSafe(NewRT));
-	}
-	else
+void ASnowDeformationVolume::CreatePingPongResources()
+{
+	int32 Resolution = 2048;
+	if (UWorld* World = GetWorld())
 	{
-		UE_LOG(LogTemp, Error, TEXT("[SnowVolume::OnRenderTargetChanged] FAILED! SnowMID: %s | NewRT: %s"),
-			*GetNameSafe(SnowMID), *GetNameSafe(NewRT));
+		if (USnowDeformationSubsystem* Subsystem = World->GetSubsystem<USnowDeformationSubsystem>())
+		{
+			Resolution = Subsystem->RenderTargetResolution;
+		}
 	}
+
+	SnowHeightRT_A = NewObject<UTextureRenderTarget2D>(this);
+	if (SnowHeightRT_A)
+	{
+		SnowHeightRT_A->RenderTargetFormat = RTF_RGBA16f;
+		SnowHeightRT_A->ClearColor = FLinearColor::Black;
+		SnowHeightRT_A->bAutoGenerateMips = false;
+		SnowHeightRT_A->bCanCreateUAV = false;
+		SnowHeightRT_A->Filter = TF_Bilinear;
+		SnowHeightRT_A->AddressX = TA_Clamp;
+		SnowHeightRT_A->AddressY = TA_Clamp;
+		SnowHeightRT_A->InitAutoFormat(Resolution, Resolution);
+		SnowHeightRT_A->UpdateResourceImmediate(true);
+		UKismetRenderingLibrary::ClearRenderTarget2D(GetWorld(), SnowHeightRT_A, FLinearColor::Black);
+	}
+
+	SnowHeightRT_B = NewObject<UTextureRenderTarget2D>(this);
+	if (SnowHeightRT_B)
+	{
+		SnowHeightRT_B->RenderTargetFormat = RTF_RGBA16f;
+		SnowHeightRT_B->ClearColor = FLinearColor::Black;
+		SnowHeightRT_B->bAutoGenerateMips = false;
+		SnowHeightRT_B->bCanCreateUAV = false;
+		SnowHeightRT_B->Filter = TF_Bilinear;
+		SnowHeightRT_B->AddressX = TA_Clamp;
+		SnowHeightRT_B->AddressY = TA_Clamp;
+		SnowHeightRT_B->InitAutoFormat(Resolution, Resolution);
+		SnowHeightRT_B->UpdateResourceImmediate(true);
+		UKismetRenderingLibrary::ClearRenderTarget2D(GetWorld(), SnowHeightRT_B, FLinearColor::Black);
+	}
+
+	if (BrushMaterialTemplate) BrushMID = UMaterialInstanceDynamic::Create(BrushMaterialTemplate, this);
+	if (ErosionMaterialTemplate) ErosionMID = UMaterialInstanceDynamic::Create(ErosionMaterialTemplate, this);
+
+	bIsRTAPrimary = true;
 }
 
 void ASnowDeformationVolume::UpdateMaterialParameters()
 {
-	if (!SnowPlaneMesh)
-	{
-		return;
-	}
+	if (!SnowPlaneMesh) return;
 
-	// 1. 머티리얼 템플릿이 지정되어 있으면 MID를 최신 템플릿 기준으로 생성/교체
 	if (SnowMaterialTemplate)
 	{
 		if (!SnowMID || SnowMID->Parent != SnowMaterialTemplate)
@@ -221,55 +200,162 @@ void ASnowDeformationVolume::UpdateMaterialParameters()
 		SnowPlaneMesh->SetMaterial(0, nullptr);
 	}
 
-	// 2. 동적 머티리얼 인스턴스에 파라미터 전달
 	if (SnowMID && BoundsBox)
 	{
 		const FVector BoxExtent = BoundsBox->GetScaledBoxExtent();
-		const FVector ActorCenter = GetActorLocation();
-
 		SnowMID->SetScalarParameterValue(TEXT("SnowDepth"), SnowDepth);
 		SnowMID->SetScalarParameterValue(TEXT("EdgeSoftness"), EdgeSoftness);
 		SnowMID->SetScalarParameterValue(TEXT("SnowAreaSize"), BoxExtent.X * 2.0f);
-		SnowMID->SetVectorParameterValue(TEXT("SnowAreaCenter"), ActorCenter);
+		SnowMID->SetVectorParameterValue(TEXT("SnowAreaCenter"), GetActorLocation());
 		SnowMID->SetVectorParameterValue(TEXT("SnowAreaExtent"), FVector(BoxExtent.X * 2.0f, BoxExtent.Y * 2.0f, BoxExtent.Z * 2.0f));
 
-		if (UWorld* World = GetWorld())
+		if (UTextureRenderTarget2D* ActiveRT = GetCurrentReadRenderTarget())
 		{
-			if (USnowDeformationSubsystem* Subsystem = World->GetSubsystem<USnowDeformationSubsystem>())
-			{
-				if (Subsystem->GetCurrentReadRenderTarget())
-				{
-					UTextureRenderTarget2D* ActiveRT = Subsystem->GetCurrentReadRenderTarget();
-					SnowMID->SetTextureParameterValue(TEXT("RT_SnowHeight"), ActiveRT);
-					SnowMID->SetTextureParameterValue(TEXT("snowHeight"), ActiveRT);
-					SnowMID->SetTextureParameterValue(TEXT("SnowHeight"), ActiveRT);
-					SnowMID->SetTextureParameterValue(TEXT("RT_Height"), ActiveRT);
-					SnowMID->SetTextureParameterValue(TEXT("RT_Snow"), ActiveRT);
-				}
-			}
+			SnowMID->SetTextureParameterValue(TEXT("RT_SnowHeight"), ActiveRT);
+			SnowMID->SetTextureParameterValue(TEXT("snowHeight"), ActiveRT);
+			SnowMID->SetTextureParameterValue(TEXT("SnowHeight"), ActiveRT);
+			SnowMID->SetTextureParameterValue(TEXT("RT_Height"), ActiveRT);
+			SnowMID->SetTextureParameterValue(TEXT("RT_Snow"), ActiveRT);
+			SnowMID->SetTextureParameterValue(TEXT("DeformationRT"), ActiveRT);
+			SnowMID->SetTextureParameterValue(TEXT("Texture"), ActiveRT);
 		}
 	}
 }
 
-void ASnowDeformationVolume::SyncBoundsToSubsystem()
+bool ASnowDeformationVolume::IsInsideSnowArea(const FVector& WorldLocation) const
 {
-	UWorld* World = GetWorld();
-	if (!World || !BoundsBox)
-	{
-		return;
-	}
-
-	USnowDeformationSubsystem* Subsystem = World->GetSubsystem<USnowDeformationSubsystem>();
-	if (!Subsystem)
-	{
-		return;
-	}
-
-	// 45도 회전된 경사로도 완벽히 지원하기 위해 전체 Transform(위치, 회전, 스케일)을 전달
-	const FTransform VolumeTransform = GetActorTransform();
+	if (!BoundsBox) return false;
 	const FVector BoxExtent = BoundsBox->GetScaledBoxExtent();
+	if (BoxExtent.X <= 0.0f || BoxExtent.Y <= 0.0f) return false;
 
-	Subsystem->SetSnowVolumeTransform(VolumeTransform, BoxExtent, SnowDepth);
+	const FVector LocalPos = GetActorTransform().InverseTransformPosition(WorldLocation);
+	if (FMath::Abs(LocalPos.X) > BoxExtent.X || FMath::Abs(LocalPos.Y) > BoxExtent.Y) return false;
+
+	const float MaxLocalZ = BoxExtent.Z + 150.0f;
+	const float MinLocalZ = -BoxExtent.Z - 100.0f;
+	return (LocalPos.Z >= MinLocalZ && LocalPos.Z <= MaxLocalZ);
+}
+
+bool ASnowDeformationVolume::WorldLocationToUV(const FVector& WorldLocation, FVector2D& OutUV) const
+{
+	if (!BoundsBox) return false;
+	const FVector BoxExtent = BoundsBox->GetScaledBoxExtent();
+	if (BoxExtent.X <= 0.0f || BoxExtent.Y <= 0.0f) return false;
+
+	const FVector LocalPos = GetActorTransform().InverseTransformPosition(WorldLocation);
+	if (FMath::Abs(LocalPos.X) > BoxExtent.X || FMath::Abs(LocalPos.Y) > BoxExtent.Y) return false;
+
+	const float MaxLocalZ = BoxExtent.Z + 150.0f;
+	const float MinLocalZ = -BoxExtent.Z - 100.0f;
+	if (LocalPos.Z < MinLocalZ || LocalPos.Z > MaxLocalZ) return false;
+
+	OutUV.X = (LocalPos.X + BoxExtent.X) / (BoxExtent.X * 2.0f);
+	OutUV.Y = (LocalPos.Y + BoxExtent.Y) / (BoxExtent.Y * 2.0f);
+	return true;
+}
+
+float ASnowDeformationVolume::GetSnowSurfaceZ() const
+{
+	if (!BoundsBox) return 0.0f;
+	return GetActorLocation().Z - BoundsBox->GetScaledBoxExtent().Z + SnowDepth;
+}
+
+float ASnowDeformationVolume::GetSnowBaseZ() const
+{
+	if (!BoundsBox) return 0.0f;
+	return GetActorLocation().Z - BoundsBox->GetScaledBoxExtent().Z;
+}
+
+void ASnowDeformationVolume::RegisterDeformationPayload(const FSnowDeformationPayload& InPayload)
+{
+	PendingPayloads.Add(InPayload);
+}
+
+void ASnowDeformationVolume::ProcessDeformationBatch(float DeltaTime)
+{
+	bool bEnableErosion = false;
+	if (UWorld* World = GetWorld())
+	{
+		if (USnowDeformationSubsystem* Subsystem = World->GetSubsystem<USnowDeformationSubsystem>())
+		{
+			bEnableErosion = Subsystem->bEnableErosion;
+		}
+	}
+
+	if (PendingPayloads.Num() == 0 && !bEnableErosion) return;
+
+	UTextureRenderTarget2D* ReadRT = GetCurrentReadRenderTarget();
+	UTextureRenderTarget2D* WriteRT = GetCurrentWriteRenderTarget();
+
+	if (!ReadRT || !WriteRT || !BrushMID) return;
+
+	FTextureRenderTargetResource* ReadResource = ReadRT->GameThread_GetRenderTargetResource();
+	FTextureRenderTargetResource* WriteResource = WriteRT->GameThread_GetRenderTargetResource();
+
+	if (!ReadResource || !WriteResource) return;
+
+	ENQUEUE_RENDER_COMMAND(SnowCopyRTCommand)(
+		[ReadResource, WriteResource](FRHICommandListImmediate& RHICmdList)
+		{
+			FTextureRHIRef SourceRHI = ReadResource->GetRenderTargetTexture();
+			FTextureRHIRef TargetRHI = WriteResource->GetRenderTargetTexture();
+			if (SourceRHI && TargetRHI)
+			{
+				RHICmdList.CopyTexture(SourceRHI, TargetRHI, FRHICopyTextureInfo());
+			}
+		}
+	);
+
+	FCanvas DrawCanvas(WriteResource, nullptr, GetWorld(), GetWorld()->FeatureLevel);
+	UCanvas* CanvasObj = NewObject<UCanvas>(GetTransientPackage());
+	if (CanvasObj)
+	{
+		CanvasObj->Canvas = &DrawCanvas;
+		CanvasObj->SizeX = WriteRT->SizeX;
+		CanvasObj->SizeY = WriteRT->SizeY;
+		const FVector2D CanvasSize(WriteRT->SizeX, WriteRT->SizeY);
+
+		for (const FSnowDeformationPayload& Payload : PendingPayloads)
+		{
+			FVector2D HitUV;
+			if (!WorldLocationToUV(Payload.HitLocationWorld, HitUV)) continue;
+
+			// World Radius to UV Radius
+			const FVector BoxExtent = BoundsBox->GetScaledBoxExtent();
+			const float TotalVolumeWidth = BoxExtent.X * 2.0f;
+			const float RadiusUV = (TotalVolumeWidth > 0.0f) ? (Payload.RadiusWorld / TotalVolumeWidth) : 0.015f;
+
+			const float PixelX = HitUV.X * CanvasSize.X;
+			const float PixelY = HitUV.Y * CanvasSize.Y;
+			const float RadiusPx = RadiusUV * CanvasSize.X;
+			const float Size = RadiusPx * 2.0f;
+
+			BrushMID->SetScalarParameterValue(TEXT("DepthIntensity"), Payload.DepthIntensity);
+			BrushMID->SetTextureParameterValue(TEXT("PreviousRT"), ReadRT);
+
+			const FVector2D ScreenPos(PixelX - RadiusPx, PixelY - RadiusPx);
+			const FVector2D ScreenSize(Size, Size);
+			
+			CanvasObj->K2_DrawMaterial(BrushMID, ScreenPos, ScreenSize, FVector2D::ZeroVector, FVector2D::UnitVector, Payload.RotationAngle, FVector2D(0.5f, 0.5f));
+		}
+	}
+
+	DrawCanvas.Flush_GameThread(true);
+	PendingPayloads.Reset();
+	SwapPingPongBuffers();
+
+	// Update the SnowMID pointer to the new Read RT
+	if (SnowMID && GetCurrentReadRenderTarget())
+	{
+		UTextureRenderTarget2D* ActiveRT = GetCurrentReadRenderTarget();
+		SnowMID->SetTextureParameterValue(TEXT("RT_SnowHeight"), ActiveRT);
+		SnowMID->SetTextureParameterValue(TEXT("snowHeight"), ActiveRT);
+		SnowMID->SetTextureParameterValue(TEXT("SnowHeight"), ActiveRT);
+		SnowMID->SetTextureParameterValue(TEXT("RT_Height"), ActiveRT);
+		SnowMID->SetTextureParameterValue(TEXT("RT_Snow"), ActiveRT);
+		SnowMID->SetTextureParameterValue(TEXT("DeformationRT"), ActiveRT);
+		SnowMID->SetTextureParameterValue(TEXT("Texture"), ActiveRT);
+	}
 }
 
 #if WITH_EDITOR
@@ -277,15 +363,5 @@ void ASnowDeformationVolume::PostEditChangeProperty(FPropertyChangedEvent& Prope
 {
 	Super::PostEditChangeProperty(PropertyChangedEvent);
 	UpdateMaterialParameters();
-	SyncBoundsToSubsystem();
-}
-
-void ASnowDeformationVolume::PostEditMove(bool bFinished)
-{
-	Super::PostEditMove(bFinished);
-	if (bFinished)
-	{
-		SyncBoundsToSubsystem();
-	}
 }
 #endif

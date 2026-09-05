@@ -19,13 +19,13 @@ struct FSnowDeformationPayload
 {
 	GENERATED_BODY()
 
-	/** 렌더 타깃(RT) 도화지 상의 중심 UV 좌표 (0.0 ~ 1.0) */
+	/** 충돌/접촉한 월드 좌표 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Snow Deformation")
-	FVector2D HitUV = FVector2D::ZeroVector;
+	FVector HitLocationWorld = FVector::ZeroVector;
 
-	/** 브러시 가로 두께 반경 (UV 스페이스 기준 비율, 예: 0.015f = 1024 텍스처 기준 약 15픽셀) */
+	/** 브러시 가로 두께 반경 (월드 좌표 cm 단위) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Snow Deformation")
-	float Radius = 0.015f;
+	float RadiusWorld = 15.0f;
 
 	/**
 	 * 이동 궤적 길이 (P1 -> P2 이동 거리, UV 스페이스 기준)
