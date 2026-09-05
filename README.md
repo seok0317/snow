@@ -55,6 +55,8 @@ void USnowDeformationSubsystem::RegisterDeformationPayload(const FSnowDeformatio
 
 처음엔 발자국 하나 찍는 게 이렇게 단계가 나뉠 일인가 싶었는데, 거리 컬링· 텔레포트 방지·서브 스텝 보간까지 하나씩 필요해지면서 구조가 자연스럽게 여기까지 늘어났습니다.
 
+[체크포인트 영상](https://youtu.be/92rN6e0vMzg)
+
 </details>
 
 ## 사용 기술
